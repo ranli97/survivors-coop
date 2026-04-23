@@ -15,6 +15,13 @@ const config = {
         mode: Scale.FIT,
         autoCenter: Scale.CENTER_BOTH
     },
+    physics: {
+        default: 'arcade',
+        arcade: {
+            gravity: { y: 0 },
+            debug: false
+        }
+    },
     scene: [
         Boot,
         Preloader,
