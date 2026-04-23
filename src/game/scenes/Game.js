@@ -80,6 +80,27 @@ export class Game extends Scene
         this.worldWidth = WORLD_WIDTH;
         this.worldHeight = WORLD_HEIGHT;
 
+        // --- Player stats ---------------------------------------------------------
+        this.playerMaxHp = 100;
+        this.playerHp = 100;
+        // Guard: overlap callbacks can fire multiple times on the frame HP
+        // hits 0, which would queue up multiple scene transitions. This flag
+        // makes sure damage + scene.start each happen at most once.
+        this.playerDead = false;
+
+        // --- HUD ------------------------------------------------------------------
+        // HP text pinned to the top-left of the screen. setScrollFactor(0)
+        // keeps it fixed relative to the camera, so it doesn't move with the
+        // world as the player scrolls.
+        this.hpText = this.add.text(16, 16, '', {
+            fontFamily: 'Arial Black',
+            fontSize: 24,
+            color: '#ffffff',
+            stroke: '#000000',
+            strokeThickness: 4
+        }).setScrollFactor(0);
+        this.updateHpText();
+
         // --- Enemies --------------------------------------------------------------
         // Physics group that owns every enemy. Members get dynamic Arcade bodies.
         this.enemies = this.physics.add.group();
@@ -101,6 +122,12 @@ export class Game extends Scene
             const y = this.player.y + Math.sin(angle) * dist;
             this.spawnEnemy(x, y);
         }
+
+        // --- Combat overlaps ------------------------------------------------------
+        // overlap (not collider) so enemies don't physically push the player --
+        // we just want the callback to fire when bodies touch.
+        this.physics.add.overlap(this.bullets, this.enemies, this.onBulletHitEnemy, null, this);
+        this.physics.add.overlap(this.player,  this.enemies, this.onEnemyTouchPlayer, null, this);
     }
 
     update ()
@@ -215,6 +242,11 @@ export class Game extends Scene
         const enemy = this.enemies.create(x, y, 'enemy');
         enemy.body.setCircle(ENEMY_RADIUS);
         enemy.setCollideWorldBounds(true);
+        // Per-enemy combat state. Stored via setData so it travels with the
+        // sprite and is trivial to customize per-enemy later (e.g. tougher
+        // variants just pass a higher starting hp).
+        enemy.setData('hp', 1);
+        enemy.setData('lastHitTime', 0);
         return enemy;
     }
 
@@ -245,6 +277,69 @@ export class Game extends Scene
 
             enemy.body.setVelocity(dx * ENEMY_SPEED, dy * ENEMY_SPEED);
         });
+    }
+
+    // Bullet overlapping an enemy: consume the bullet, take 1 hp off the
+    // enemy, and destroy it if hp has reached zero.
+    onBulletHitEnemy (bullet, enemy)
+    {
+        if (!bullet.active || !enemy.active) return;
+
+        bullet.destroy();
+
+        const newHp = enemy.getData('hp') - 1;
+        enemy.setData('hp', newHp);
+        if (newHp <= 0)
+        {
+            enemy.destroy();
+        }
+    }
+
+    // Enemy overlapping the player: apply a 10 hp hit, but only if this
+    // specific enemy hasn't hit in the last 1000 ms. Overlap callbacks fire
+    // every frame bodies are in contact, so the cooldown is what turns
+    // "continuous contact" into discrete damage ticks.
+    onEnemyTouchPlayer (player, enemy)
+    {
+        if (this.playerDead) return;
+        if (!enemy.active) return;
+
+        const DAMAGE_COOLDOWN_MS = 1000;
+        const now = this.time.now;
+        if (now - enemy.getData('lastHitTime') < DAMAGE_COOLDOWN_MS) return;
+        enemy.setData('lastHitTime', now);
+
+        this.playerHp -= 10;
+        this.updateHpText();
+        this.flashPlayerHit();
+
+        if (this.playerHp <= 0)
+        {
+            // Latch so any further overlap callbacks on this frame are no-ops.
+            this.playerDead = true;
+            this.scene.start('GameOver');
+        }
+    }
+
+    // Brief red tint on the player so damage is visible on the HUD *and* the
+    // player sprite itself.
+    flashPlayerHit ()
+    {
+        this.player.setTint(0xff4444);
+        this.time.delayedCall(100, () => {
+            // The scene may have already transitioned to GameOver by the time
+            // this fires, in which case this.player has been torn down.
+            if (this.player && this.player.active)
+            {
+                this.player.clearTint();
+            }
+        });
+    }
+
+    // Refresh the HP readout in the HUD. Call whenever this.playerHp changes.
+    updateHpText ()
+    {
+        this.hpText.setText(`HP: ${this.playerHp}`);
     }
 
     // Generate a solid-color circle texture we can use as a sprite.
