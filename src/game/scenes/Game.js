@@ -79,6 +79,28 @@ export class Game extends Scene
         // without having to know the WORLD_WIDTH/HEIGHT constants.
         this.worldWidth = WORLD_WIDTH;
         this.worldHeight = WORLD_HEIGHT;
+
+        // --- Enemies --------------------------------------------------------------
+        // Physics group that owns every enemy. Members get dynamic Arcade bodies.
+        this.enemies = this.physics.add.group();
+
+        // Red circle texture (reuses the same helper the player/bullet use).
+        this.createCircleTexture('enemy', 14, 0xdd3333);
+
+        // Spawn 5 enemies scattered around the player in a 300-600 px ring at
+        // random angles -- so they appear surrounding the player rather than
+        // clustered on one side, and none spawn on top of the player.
+        const ENEMY_COUNT = 5;
+        const MIN_SPAWN_DIST = 300;
+        const MAX_SPAWN_DIST = 600;
+        for (let i = 0; i < ENEMY_COUNT; i++)
+        {
+            const angle = Math.random() * Math.PI * 2;
+            const dist = MIN_SPAWN_DIST + Math.random() * (MAX_SPAWN_DIST - MIN_SPAWN_DIST);
+            const x = this.player.x + Math.cos(angle) * dist;
+            const y = this.player.y + Math.sin(angle) * dist;
+            this.spawnEnemy(x, y);
+        }
     }
 
     update ()
@@ -149,6 +171,10 @@ export class Game extends Scene
                 bullet.destroy();
             }
         });
+
+        // --- Enemies --------------------------------------------------------------
+        // Chase logic is in a helper to keep update() readable.
+        this.updateEnemies();
     }
 
     // --- Helpers -----------------------------------------------------------------
@@ -179,6 +205,46 @@ export class Game extends Scene
             Math.cos(angle) * BULLET_SPEED,
             Math.sin(angle) * BULLET_SPEED
         );
+    }
+
+    // Create one enemy at (x, y), add it to the enemies group, give it a
+    // circular hit area that matches the visual, and keep it inside the world.
+    spawnEnemy (x, y)
+    {
+        const ENEMY_RADIUS = 14;
+        const enemy = this.enemies.create(x, y, 'enemy');
+        enemy.body.setCircle(ENEMY_RADIUS);
+        enemy.setCollideWorldBounds(true);
+        return enemy;
+    }
+
+    // Each frame, steer every enemy straight toward the player at a fixed speed.
+    updateEnemies ()
+    {
+        const ENEMY_SPEED = 100;
+
+        // getChildren() returns a plain array; slice() mirrors the bullet
+        // cleanup pattern and guards against any mid-loop mutation.
+        this.enemies.getChildren().slice().forEach((enemy) => {
+            if (!enemy || !enemy.active) return;
+
+            // Direction vector from enemy toward the player.
+            let dx = this.player.x - enemy.x;
+            let dy = this.player.y - enemy.y;
+
+            // Normalize so enemies travel at a constant speed regardless of
+            // distance. Skip the rare zero-length case to avoid divide-by-zero.
+            const length = Math.sqrt(dx * dx + dy * dy);
+            if (length === 0)
+            {
+                enemy.body.setVelocity(0, 0);
+                return;
+            }
+            dx /= length;
+            dy /= length;
+
+            enemy.body.setVelocity(dx * ENEMY_SPEED, dy * ENEMY_SPEED);
+        });
     }
 
     // Generate a solid-color circle texture we can use as a sprite.
