@@ -1370,8 +1370,7 @@ export class Game extends Scene
 
     // Boss HP reached 0. Clear the fight state, destroy every boss-related
     // entity + HUD element, show a victory banner, and queue a transition
-    // to GameOver. A proper Victory scene replaces the GameOver hand-off in
-    // a later step; the console.log is the breadcrumb for that change.
+    // to the Victory scene after the banner finishes.
     onBossDefeated ()
     {
         this.bossActive = false;
@@ -1388,14 +1387,14 @@ export class Game extends Scene
         if (this.bossBullets) this.bossBullets.getChildren().slice().forEach(b => b.destroy());
 
         this.showBanner('VICTORY!', 'You have defeated the Purple Menace', 3000);
-        console.log('BOSS DEFEATED -- victory scene coming in Step E');
 
         // playerDead guard: the victory transition fires 3s after the boss
         // dies, during which the player can still be touched by a leftover
         // minion spawned on the same frame. If that kills them, the
-        // GameOver scene is already running and we skip the duplicate.
+        // GameOver scene is already running and we skip the duplicate --
+        // losing-while-winning correctly ends on GameOver.
         this.time.delayedCall(3000, () => {
-            if (!this.playerDead) this.scene.start('GameOver');
+            if (!this.playerDead) this.scene.start('Victory', { classKey: this.classKey });
         });
     }
 
