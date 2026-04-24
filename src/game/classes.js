@@ -79,7 +79,11 @@ export const CLASSES = {
         // these fields on other classes is what keeps RMB inert for them.
         canHeal: true,
         healRadius: 150,
-        healPerSecond: 10
+        healPerSecond: 10,
+        // Throwable potions -- also medic-only. Kept as a separate flag from
+        // canHeal so the two subsystems can be enabled independently later
+        // (e.g. a future support class could throw potions without healing).
+        canThrowPotions: true
     }
 };
 

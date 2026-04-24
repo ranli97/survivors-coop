@@ -1,5 +1,11 @@
 import { Scene } from 'phaser';
 import { CLASSES, DEFAULT_CLASS_KEY } from '../classes.js';
+import {
+    POTIONS, POTION_ORDER,
+    POTION_COOLDOWN_MS, POTION_BUFF_DURATION_MS, POTION_GROUND_LIFETIME_MS,
+    POTION_THROW_SPEED, POTION_MAX_RANGE,
+    POTION_PICKUP_RADIUS, POTION_PROJECTILE_RADIUS, POTION_GROUND_RADIUS
+} from '../potions.js';
 
 // Healing cadence for the medic's aura. 10 ticks/sec keeps the HUD "HP tick
 // up" feel smooth while keeping per-tick amounts integer for typical
@@ -140,6 +146,32 @@ export class Game extends Scene
         // Small yellow circle texture for bullets (same trick as the player).
         this.createCircleTexture('bullet', 4, 0xffff00);
 
+        // --- Potions --------------------------------------------------------------
+        // Two groups: airborne projectiles (while flying from the medic toward
+        // the cursor) and landed ground pickups (what any friendly entity can
+        // walk over to receive the buff). Both are physics groups so bodies
+        // come enabled automatically via group.create().
+        this.potionProjectiles = this.physics.add.group();
+        this.potionGroundItems = this.physics.add.group();
+
+        // One texture per potion type. Sized to POTION_GROUND_RADIUS (the big
+        // version); mid-flight projectiles just render at a smaller scale.
+        for (const pKey of POTION_ORDER)
+        {
+            this.createCircleTexture(`potion_${pKey}`, POTION_GROUND_RADIUS, POTIONS[pKey].color);
+        }
+
+        // ms-since-scene-start when each ability comes off cooldown. 0 = ready.
+        this.potionCooldowns = { damage: 0, speed: 0, fireRate: 0 };
+        // ms-since-scene-start when each buff expires. 0 (or past) = inactive.
+        this.activeBuffs = { damage: 0, speed: 0, fireRate: 0 };
+
+        // Hotkeys + manual edge-trigger bookkeeping. We don't use JustDown
+        // because that's a Phaser.* global; tracking the previous state
+        // ourselves is equivalent and keeps the import list clean.
+        this.potionKeys = this.input.keyboard.addKeys('ONE,TWO,THREE');
+        this.potionKeyWasDown = { ONE: false, TWO: false, THREE: false };
+
         // Timestamp (ms, scene time) of the last bullet we fired. Used to
         // throttle auto-fire to 8 shots/sec.
         this.lastFireTime = 0;
@@ -193,6 +225,43 @@ export class Game extends Scene
             strokeThickness: 3
         }).setScrollFactor(0);
 
+        // Potion HUD (medic only). Bottom-left cluster of 3 slots, one per
+        // potion in POTION_ORDER. updatePotionHud() fills in cooldown dimming
+        // and active-buff outlines each frame. Non-medic classes get a null
+        // handle, and update() skips updatePotionHud() for them.
+        this.potionHud = null;
+        if (this.classDef.canThrowPotions === true)
+        {
+            this.potionHud = {};
+            const slotW = 48;
+            const slotH = 48;
+            const gap = 16;
+            const baseX = 16;
+            const y = this.scale.height - 60;
+
+            POTION_ORDER.forEach((potionKey, i) => {
+                const potionDef = POTIONS[potionKey];
+                const cx = baseX + slotW / 2 + i * (slotW + gap);
+
+                const rect = this.add.rectangle(cx, y, slotW, slotH, potionDef.color, 0.9)
+                    .setScrollFactor(0);
+                const keyLabel = this.add.text(cx, y - slotH / 2 - 2, String(i + 1), {
+                    fontFamily: 'Arial Black', fontSize: 14,
+                    color: '#ffffff', stroke: '#000000', strokeThickness: 3
+                }).setOrigin(0.5, 1).setScrollFactor(0);
+                const nameLabel = this.add.text(cx, y + slotH / 2 + 2, potionDef.name, {
+                    fontFamily: 'Arial Black', fontSize: 14,
+                    color: '#ffffff', stroke: '#000000', strokeThickness: 3
+                }).setOrigin(0.5, 0).setScrollFactor(0);
+                const cdText = this.add.text(cx, y, '', {
+                    fontFamily: 'Arial Black', fontSize: 20,
+                    color: '#ffffff', stroke: '#000000', strokeThickness: 4
+                }).setOrigin(0.5).setScrollFactor(0);
+
+                this.potionHud[potionKey] = { rect, keyLabel, nameLabel, cdText };
+            });
+        }
+
         // Level readout (top-center). Same font family as hpText so the HUD
         // reads as a single visual group.
         this.levelText = this.add.text(this.scale.width / 2, 16, '', {
@@ -229,6 +298,10 @@ export class Game extends Scene
         // we just want the callback to fire when bodies touch.
         this.physics.add.overlap(this.bullets, this.enemies, this.onBulletHitEnemy, null, this);
         this.physics.add.overlap(this.player,  this.enemies, this.onEnemyTouchPlayer, null, this);
+        // Pickup overlap is registered for every class (not just medic) so
+        // that when allies exist later, they pick up potions through the same
+        // code path. Non-medics can't spawn potions so this is benign today.
+        this.physics.add.overlap(this.player, this.potionGroundItems, this.onPickupPotion, null, this);
     }
 
     update ()
@@ -238,8 +311,17 @@ export class Game extends Scene
         // regardless of healing state below; only firing is gated.
         this.updateHealing();
 
+        // Potion pipeline: input -> projectiles in flight -> ground pickups
+        // -> HUD readout. Order matters: input can spawn a projectile this
+        // frame, but projectile stepping runs next frame (velocity was just
+        // set), and HUD always reflects the latest cooldown/buff state.
+        this.updatePotionInput();
+        this.updatePotionProjectiles();
+        this.updatePotionGroundItems();
+        if (this.potionHud) this.updatePotionHud();
+
         // Per-class movement speed (medic 220 > brawler/gunner 200 > sniper 180).
-        const SPEED = this.classDef.speed;
+        const SPEED = this.classDef.speed * this.getBuffMultiplier('speed');
         const body = this.player.body;
 
         // Read WASD into a simple direction vector.
@@ -277,7 +359,9 @@ export class Game extends Scene
         // (sniper 1/s, brawler ~1.5/s, medic 4/s, gunner 12/s). fireWeapon()
         // itself dispatches on weapon type -- one call = "one trigger pull",
         // which for the shotgun means a full pellet spread.
-        const FIRE_INTERVAL_MS = this.classDef.fireRateMs;
+        // Fire-rate buff is an interval scalar (<1 = faster), so multiplying
+        // does the right thing without special-casing the direction.
+        const FIRE_INTERVAL_MS = this.classDef.fireRateMs * this.getBuffMultiplier('fireRate');
         // Holding RMB to heal suppresses firing -- medic can't do both at
         // once. For non-medic classes isHealing is always false, so this
         // extra check is a no-op for them.
@@ -343,7 +427,10 @@ export class Game extends Scene
         // per-frame range check can skip the sqrt.
         bullet.setData('spawnX', spawnX);
         bullet.setData('spawnY', spawnY);
-        bullet.setData('damage', this.classDef.bulletDamage);
+        // Damage is baked in at fire-time; bullets already mid-flight don't
+        // retroactively gain damage when the buff starts or lose it when it
+        // ends. Matches the spec and keeps per-bullet bookkeeping simple.
+        bullet.setData('damage', this.classDef.bulletDamage * this.getBuffMultiplier('damage'));
         bullet.setData('range', range);
         bullet.setData('rangeSq', range * range);
 
@@ -463,6 +550,201 @@ export class Game extends Scene
             }
             // Future ally branch: read maxHp off setData and clamp identically.
         }
+    }
+
+    // Manual edge-trigger for 1/2/3. We can't use Phaser.Input.Keyboard.JustDown
+    // because that's a Phaser.* global; the import rules forbid those here.
+    // Instead we stash last frame's isDown per key and act on the down-transition.
+    updatePotionInput ()
+    {
+        if (this.classDef.canThrowPotions !== true) return;
+
+        const keyNames = ['ONE', 'TWO', 'THREE'];
+        for (let i = 0; i < keyNames.length; i++)
+        {
+            const name = keyNames[i];
+            const isDown = this.potionKeys[name].isDown;
+            // Only fire on the transition from up->down. Holding the key
+            // must not rethrow every frame.
+            if (isDown && !this.potionKeyWasDown[name])
+            {
+                this.tryThrowPotion(POTION_ORDER[i]);
+            }
+            this.potionKeyWasDown[name] = isDown;
+        }
+    }
+
+    // Throw attempt for a single potion slot. Bails silently if the ability
+    // is on cooldown so the input layer can fire this blindly.
+    tryThrowPotion (potionKey)
+    {
+        if (this.time.now < this.potionCooldowns[potionKey]) return;
+
+        // Aim from player -> cursor (world coords). We clamp the target to
+        // POTION_MAX_RANGE so a click at the far edge of the screen doesn't
+        // send the potion flying across the map.
+        const pointer = this.input.activePointer;
+        let tx = pointer.worldX;
+        let ty = pointer.worldY;
+        const dx = tx - this.player.x;
+        const dy = ty - this.player.y;
+        const distSq = dx * dx + dy * dy;
+        if (distSq > POTION_MAX_RANGE * POTION_MAX_RANGE)
+        {
+            const dist = Math.sqrt(distSq);
+            const scale = POTION_MAX_RANGE / dist;
+            tx = this.player.x + dx * scale;
+            ty = this.player.y + dy * scale;
+        }
+
+        const angle = Math.atan2(ty - this.player.y, tx - this.player.x);
+
+        // Spawn the projectile. We reuse the ground-sized texture and scale
+        // it down mid-flight -- cheaper than maintaining two textures per
+        // potion and visually implies "it grows when it hits the ground".
+        const proj = this.potionProjectiles.create(this.player.x, this.player.y, `potion_${potionKey}`);
+        proj.setScale(POTION_PROJECTILE_RADIUS / POTION_GROUND_RADIUS);
+        // Center the circular body on the scaled sprite. The texture is
+        // POTION_GROUND_RADIUS*2 px wide, so the offset to center a
+        // POTION_PROJECTILE_RADIUS body is (ground - projectile) on each axis.
+        proj.body.setCircle(
+            POTION_PROJECTILE_RADIUS,
+            POTION_GROUND_RADIUS - POTION_PROJECTILE_RADIUS,
+            POTION_GROUND_RADIUS - POTION_PROJECTILE_RADIUS
+        );
+        proj.setData('potionKey', potionKey);
+        proj.setData('targetX', tx);
+        proj.setData('targetY', ty);
+        proj.setData('spawnX', this.player.x);
+        proj.setData('spawnY', this.player.y);
+        proj.body.setVelocity(Math.cos(angle) * POTION_THROW_SPEED, Math.sin(angle) * POTION_THROW_SPEED);
+
+        this.potionCooldowns[potionKey] = this.time.now + POTION_COOLDOWN_MS;
+    }
+
+    // Step each in-flight potion. When it reaches its stored target (within
+    // 8px), replace it with a ground pickup. Defensive world-bounds cleanup
+    // catches any projectile that somehow escapes (shouldn't happen because
+    // target is clamped, but cheap insurance).
+    updatePotionProjectiles ()
+    {
+        const kids = this.potionProjectiles.getChildren().slice();
+        for (const proj of kids)
+        {
+            if (!proj || !proj.active) continue;
+
+            const pk = proj.getData('potionKey');
+            const tx = proj.getData('targetX');
+            const ty = proj.getData('targetY');
+
+            const ddx = tx - proj.x;
+            const ddy = ty - proj.y;
+            // 8px proximity threshold -- matches the spec flowchart and is
+            // a bit larger than POTION_PROJECTILE_RADIUS to guarantee we
+            // never skip past the target between frames at THROW_SPEED.
+            if (ddx * ddx + ddy * ddy <= 8 * 8)
+            {
+                proj.destroy();
+                this.spawnGroundPotion(pk, tx, ty);
+                continue;
+            }
+
+            if (proj.x < 0 || proj.y < 0 ||
+                proj.x > this.worldWidth || proj.y > this.worldHeight)
+            {
+                proj.destroy();
+            }
+        }
+    }
+
+    // Turn a landed projectile into a pickup. Immovable so a player walking
+    // into it doesn't shove it; the overlap callback will trigger the pickup.
+    spawnGroundPotion (potionKey, x, y)
+    {
+        const ground = this.potionGroundItems.create(x, y, `potion_${potionKey}`);
+        ground.body.setCircle(POTION_GROUND_RADIUS);
+        ground.body.setImmovable(true);
+        ground.body.setVelocity(0, 0);
+        ground.setData('potionKey', potionKey);
+        ground.setData('spawnTime', this.time.now);
+    }
+
+    // Pulse the ground pickups and despawn any that have aged past
+    // POTION_GROUND_LIFETIME_MS. The pulse is a slow sine in alpha so the
+    // player can see where potions are without them being distracting.
+    updatePotionGroundItems ()
+    {
+        const kids = this.potionGroundItems.getChildren().slice();
+        for (const ground of kids)
+        {
+            if (!ground || !ground.active) continue;
+            const age = this.time.now - ground.getData('spawnTime');
+            const t = age / 1000;
+            // 0.6 baseline + 0.4 swing => alpha oscillates 0.6..1.0.
+            ground.setAlpha(0.6 + 0.4 * (0.5 + 0.5 * Math.sin(t * 4)));
+            if (age >= POTION_GROUND_LIFETIME_MS)
+            {
+                ground.destroy();
+            }
+        }
+    }
+
+    // Any friendly overlap consumes the potion and sets/refreshes the buff.
+    // `player` is whichever friendly entity triggered the overlap -- today
+    // always this.player, but allies will flow through here unchanged.
+    onPickupPotion (player, potion)
+    {
+        if (!potion.active) return;
+        const potionKey = potion.getData('potionKey');
+        // Pickup always sets activeBuffs to now+DURATION (not extends),
+        // matching the spec: "re-pickup refreshes to 3s".
+        this.activeBuffs[potionKey] = this.time.now + POTION_BUFF_DURATION_MS;
+        potion.destroy();
+    }
+
+    // Per-frame HUD update. Only runs for the medic (guarded by the null
+    // check in update()), so we can assume this.potionHud is populated.
+    updatePotionHud ()
+    {
+        for (const potionKey of POTION_ORDER)
+        {
+            const slot = this.potionHud[potionKey];
+            const potionDef = POTIONS[potionKey];
+            const cdRemaining = this.potionCooldowns[potionKey] - this.time.now;
+
+            if (cdRemaining > 0)
+            {
+                slot.rect.setFillStyle(potionDef.color, 0.3);
+                // ceil so the counter shows "7...6...5..." instead of ever
+                // flashing "0" on the frame before it unlocks.
+                slot.cdText.setText(String(Math.ceil(cdRemaining / 1000)));
+            }
+            else
+            {
+                slot.rect.setFillStyle(potionDef.color, 0.9);
+                slot.cdText.setText('');
+            }
+
+            // Active-buff outline -- a bright white ring on the slot while
+            // the corresponding buff is live on the player.
+            if (this.time.now < this.activeBuffs[potionKey])
+            {
+                slot.rect.setStrokeStyle(3, 0xffffff, 1);
+            }
+            else
+            {
+                slot.rect.setStrokeStyle();
+            }
+        }
+    }
+
+    // Return the multiplier to apply to a given stat right now. 1.0 when no
+    // buff is active so callers can always multiply unconditionally.
+    getBuffMultiplier (potionKey)
+    {
+        return this.time.now < this.activeBuffs[potionKey]
+            ? POTIONS[potionKey].buffMultiplier
+            : 1.0;
     }
 
     // Create one enemy at (x, y), add it to the enemies group, give it a
