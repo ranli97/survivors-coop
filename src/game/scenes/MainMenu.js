@@ -34,9 +34,10 @@ export class MainMenu extends Scene
             align: 'center'
         }).setOrigin(0.5);
 
-        // Any click starts the gameplay scene.
+        // Any click advances to the class-select screen, which in turn starts
+        // the Game scene with the chosen class.
         this.input.once('pointerdown', () => {
-            this.scene.start('Game');
+            this.scene.start('ClassSelect');
         });
     }
 }

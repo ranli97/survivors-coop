@@ -1,4 +1,5 @@
 import { Scene } from 'phaser';
+import { CLASSES, DEFAULT_CLASS_KEY } from '../classes.js';
 
 // Gameplay scene: sets up a large world, the player, WASD movement,
 // and a camera that follows the player.
@@ -7,6 +8,17 @@ export class Game extends Scene
     constructor ()
     {
         super('Game');
+    }
+
+    // Phaser calls init(data) before create(). ClassSelect passes the chosen
+    // class via scene.start('Game', { classKey }). If we're ever started
+    // without data (e.g. hot reload, dev tool), fall back to the default.
+    init (data)
+    {
+        const key = (data && data.classKey) || DEFAULT_CLASS_KEY;
+        // Unknown keys also fall back -- safer than crashing in create().
+        this.classKey = CLASSES[key] ? key : DEFAULT_CLASS_KEY;
+        this.classDef = CLASSES[this.classKey];
     }
 
     create ()
@@ -48,16 +60,23 @@ export class Game extends Scene
         // Build a small circle texture once, then use it as a sprite. Using a
         // sprite (rather than a raw Graphics object) keeps Arcade Physics simple.
         const PLAYER_RADIUS = 16;
-        // Green circle with a darker-green triangle "nub" on the right side
-        // (at angle 0). Phaser sprites treat rotation 0 as facing +X, so the
-        // nub visually points in whatever direction the player is aiming.
-        this.createPlayerTexture('player', PLAYER_RADIUS, 0x44dd44, 0x22aa22);
+        // Per-class texture key so each class caches its own colored sprite
+        // (re-entering Game with the same class reuses the cached texture;
+        // switching classes generates a fresh one). The "nub" is a darker
+        // shade of the class color so rotation is visible regardless of which
+        // class was picked.
+        const textureKey = `player_${this.classKey}`;
+        const nubColor = this.darkenColor(this.classDef.color, 0.6);
+        if (!this.textures.exists(textureKey))
+        {
+            this.createPlayerTexture(textureKey, PLAYER_RADIUS, this.classDef.color, nubColor);
+        }
 
         // Spawn the player in the middle of the world.
         this.player = this.physics.add.sprite(
             WORLD_WIDTH / 2,
             WORLD_HEIGHT / 2,
-            'player'
+            textureKey
         );
 
         // Keep the player inside the world bounds.
@@ -96,8 +115,9 @@ export class Game extends Scene
         this.worldHeight = WORLD_HEIGHT;
 
         // --- Player stats ---------------------------------------------------------
-        this.playerMaxHp = 100;
-        this.playerHp = 100;
+        // HP caps come from the selected class (brawler 120, sniper 80, etc.).
+        this.playerMaxHp = this.classDef.hp;
+        this.playerHp = this.classDef.hp;
         // Guard: overlap callbacks can fire multiple times on the frame HP
         // hits 0, which would queue up multiple scene transitions. This flag
         // makes sure damage + scene.start each happen at most once.
@@ -115,6 +135,16 @@ export class Game extends Scene
             strokeThickness: 4
         }).setScrollFactor(0);
         this.updateHpText();
+
+        // Class readout directly below the HP line. Smaller font than hpText
+        // so it reads as a secondary line in the same HUD group.
+        this.classText = this.add.text(16, 44, `Class: ${this.classDef.name}`, {
+            fontFamily: 'Arial Black',
+            fontSize: 18,
+            color: '#ffffff',
+            stroke: '#000000',
+            strokeThickness: 3
+        }).setScrollFactor(0);
 
         // Level readout (top-center). Same font family as hpText so the HUD
         // reads as a single visual group.
@@ -156,7 +186,8 @@ export class Game extends Scene
 
     update ()
     {
-        const SPEED = 200;
+        // Per-class movement speed (medic 220 > brawler/gunner 200 > sniper 180).
+        const SPEED = this.classDef.speed;
         const body = this.player.body;
 
         // Read WASD into a simple direction vector.
@@ -190,20 +221,21 @@ export class Game extends Scene
         this.player.rotation = Math.atan2(aimDy, aimDx);
 
         // --- Shooting -------------------------------------------------------------
-        // Hold left mouse to auto-fire at 8 shots/sec (1 bullet every 125 ms).
-        const FIRE_INTERVAL_MS = 125;
+        // Hold left mouse to auto-fire. Rate comes from the class definition
+        // (sniper 1/s, brawler ~1.5/s, medic 4/s, gunner 12/s). fireWeapon()
+        // itself dispatches on weapon type -- one call = "one trigger pull",
+        // which for the shotgun means a full pellet spread.
+        const FIRE_INTERVAL_MS = this.classDef.fireRateMs;
         if (pointer.leftButtonDown() && this.time.now - this.lastFireTime >= FIRE_INTERVAL_MS)
         {
-            this.fireBullet();
+            this.fireWeapon();
             this.lastFireTime = this.time.now;
         }
 
         // --- Bullet lifetime ------------------------------------------------------
-        // Destroy bullets that have flown more than 600 px from spawn OR that
-        // have left the world. Squared-distance comparison avoids a sqrt per
-        // bullet per frame.
-        const MAX_BULLET_DIST = 600;
-        const maxDistSq = MAX_BULLET_DIST * MAX_BULLET_DIST;
+        // Each bullet carries its own max-range-squared (cached on spawn so we
+        // don't re-square per frame). Sniper bullets travel 1500 px, shotgun
+        // pellets only 400, etc. We also retire bullets that leave the world.
         // getChildren() returns the group's internal array. We slice() it so
         // destroying bullets mid-loop can't mutate what we're iterating.
         this.bullets.getChildren().slice().forEach((bullet) => {
@@ -212,6 +244,7 @@ export class Game extends Scene
             const bdx = bullet.x - bullet.getData('spawnX');
             const bdy = bullet.y - bullet.getData('spawnY');
             const travelledSq = bdx * bdx + bdy * bdy;
+            const maxDistSq = bullet.getData('rangeSq');
 
             const outOfWorld =
                 bullet.x < 0 || bullet.x > this.worldWidth ||
@@ -230,14 +263,16 @@ export class Game extends Scene
 
     // --- Helpers -----------------------------------------------------------------
 
-    // Spawn a bullet at the player's position, travelling in whatever direction
-    // the player is currently facing (this.player.rotation, in radians).
-    fireBullet ()
+    // Spawn a single bullet from the player at the supplied angle (radians).
+    // Taking an explicit angle (rather than reading this.player.rotation)
+    // lets fireWeapon() call this N times with N different angles -- that's
+    // what turns one trigger pull into a shotgun blast or a jittered MG shot.
+    fireSingleBullet (angle)
     {
-        const BULLET_SPEED = 600;
         const BULLET_RADIUS = 4;
+        const speed = this.classDef.bulletSpeed;
+        const range = this.classDef.bulletRange;
 
-        const angle = this.player.rotation;
         const spawnX = this.player.x;
         const spawnY = this.player.y;
 
@@ -246,16 +281,61 @@ export class Game extends Scene
         const bullet = this.bullets.create(spawnX, spawnY, 'bullet');
         bullet.body.setCircle(BULLET_RADIUS);
 
-        // Remember where the bullet started so update() can retire it after it
-        // has travelled 600 px.
+        // Per-bullet metadata. spawnX/Y lets update() compute travel distance;
+        // damage is read by onBulletHitEnemy; rangeSq is pre-squared so the
+        // per-frame range check can skip the sqrt.
         bullet.setData('spawnX', spawnX);
         bullet.setData('spawnY', spawnY);
+        bullet.setData('damage', this.classDef.bulletDamage);
+        bullet.setData('range', range);
+        bullet.setData('rangeSq', range * range);
 
         // Convert the aim angle into a velocity vector.
         bullet.body.setVelocity(
-            Math.cos(angle) * BULLET_SPEED,
-            Math.sin(angle) * BULLET_SPEED
+            Math.cos(angle) * speed,
+            Math.sin(angle) * speed
         );
+    }
+
+    // One "trigger pull". Dispatches to the right firing pattern for the
+    // selected class's weapon. Called from update() on each fire-rate tick.
+    fireWeapon ()
+    {
+        const rotation = this.player.rotation;
+        const weapon = this.classDef.weapon;
+
+        if (weapon === 'pistol' || weapon === 'sniper')
+        {
+            // Dead straight single shot -- the bullet stats (damage, speed,
+            // range) are what differentiate pistol from sniper.
+            this.fireSingleBullet(rotation);
+            return;
+        }
+
+        if (weapon === 'mg')
+        {
+            // Small random angle deviation on every shot so sustained fire
+            // forms a slight cone instead of a perfect line.
+            const jitterRad = (this.classDef.jitterDegrees * Math.PI) / 180;
+            const offset = (Math.random() - 0.5) * 2 * jitterRad;
+            this.fireSingleBullet(rotation + offset);
+            return;
+        }
+
+        if (weapon === 'shotgun')
+        {
+            // Uniformly sample each pellet's angle from the full cone
+            // [rotation - half, rotation + half]. Cheap and gives a natural
+            // "spray" distribution.
+            const halfConeRad = ((this.classDef.spreadDegrees / 2) * Math.PI) / 180;
+            const pellets = this.classDef.pellets;
+            for (let i = 0; i < pellets; i++)
+            {
+                const offset = (Math.random() - 0.5) * 2 * halfConeRad;
+                this.fireSingleBullet(rotation + offset);
+            }
+            return;
+        }
     }
 
     // Create one enemy at (x, y), add it to the enemies group, give it a
@@ -314,7 +394,12 @@ export class Game extends Scene
 
         bullet.destroy();
 
-        const newHp = enemy.getData('hp') - 1;
+        // Each bullet carries its own damage value (shotgun pellet 15, sniper
+        // round 100, etc.). Enemies currently spawn with hp 1 so any hit still
+        // kills, but wiring damage through correctly means tougher enemy
+        // variants in a later step will "just work".
+        const damage = bullet.getData('damage') || 1;
+        const newHp = enemy.getData('hp') - damage;
         enemy.setData('hp', newHp);
         if (newHp <= 0)
         {
@@ -484,6 +569,18 @@ export class Game extends Scene
             if (top && top.active) top.destroy();
             if (bottom && bottom.active) bottom.destroy();
         });
+    }
+
+    // Multiply each RGB channel of a 0xRRGGBB int by `factor` (0..1) and
+    // recompose. Used to derive the player's "nub" color from whatever color
+    // the selected class picked, so every class gets a visibly darker nub
+    // without hardcoding a second color per class.
+    darkenColor (color, factor)
+    {
+        const r = Math.max(0, Math.min(255, Math.floor(((color >> 16) & 0xff) * factor)));
+        const g = Math.max(0, Math.min(255, Math.floor(((color >> 8) & 0xff) * factor)));
+        const b = Math.max(0, Math.min(255, Math.floor((color & 0xff) * factor)));
+        return (r << 16) | (g << 8) | b;
     }
 
     // Generate a solid-color circle texture we can use as a sprite.
