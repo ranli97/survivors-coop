@@ -7,6 +7,7 @@ import {
     POTION_PICKUP_RADIUS, POTION_PROJECTILE_RADIUS, POTION_GROUND_RADIUS
 } from '../potions.js';
 import { AudioManager } from '../audioManager.js';
+import { ENEMIES, DEFAULT_ENEMY_KEY } from '../enemies.js';
 
 // Healing cadence for the medic's aura. 10 ticks/sec keeps the HUD "HP tick
 // up" feel smooth while keeping per-tick amounts integer for typical
@@ -322,8 +323,14 @@ export class Game extends Scene
         // Physics group that owns every enemy. Members get dynamic Arcade bodies.
         this.enemies = this.physics.add.group();
 
-        // Red circle texture (reuses the same helper the player/bullet use).
-        this.createCircleTexture('enemy', 14, 0xdd3333);
+        // One texture per enemy type. Key shape is 'enemy_<enemyKey>' so it
+        // won't collide with the legacy 'enemy' cache key and so spawnEnemy
+        // can resolve the texture name from the enemyKey alone.
+        for (const enemyKey of Object.keys(ENEMIES))
+        {
+            const def = ENEMIES[enemyKey];
+            this.createCircleTexture(`enemy_${enemyKey}`, def.radius, def.color);
+        }
 
         // Kick off the first wave. The ring-spawn math that used to live here
         // has moved into startLevel() so every level can reuse it.
@@ -815,28 +822,49 @@ export class Game extends Scene
 
     // Create one enemy at (x, y), add it to the enemies group, give it a
     // circular hit area that matches the visual, and keep it inside the world.
-    spawnEnemy (x, y)
+    //
+    // enemyKey is optional. If omitted (as in the boss minion spawn path)
+    // we fall back to DEFAULT_ENEMY_KEY = 'grunt', so every pre-existing
+    // call site keeps its current behavior without edits.
+    spawnEnemy (x, y, enemyKey)
     {
-        const ENEMY_RADIUS = 14;
-        const enemy = this.enemies.create(x, y, 'enemy');
-        enemy.body.setCircle(ENEMY_RADIUS);
+        const key = enemyKey || DEFAULT_ENEMY_KEY;
+        const def = ENEMIES[key] || ENEMIES[DEFAULT_ENEMY_KEY];
+
+        const enemy = this.enemies.create(x, y, `enemy_${key}`);
+        enemy.body.setCircle(def.radius);
         enemy.setCollideWorldBounds(true);
-        // Per-enemy combat state. Stored via setData so it travels with the
-        // sprite and is trivial to customize per-enemy later (e.g. tougher
-        // variants just pass a higher starting hp).
-        enemy.setData('hp', 1);
+
+        // Per-enemy combat state. speed is stored on the sprite (not a
+        // hardcoded constant) so updateEnemies() can route tanks/grunts
+        // through the same loop without special-casing. enemyKey is kept
+        // for future per-type behavior hooks (e.g. tank-only knockback res).
+        enemy.setData('enemyKey', key);
+        enemy.setData('hp', def.hp);
+        enemy.setData('speed', def.speed);
         enemy.setData('lastHitTime', 0);
+
         // HUD readout of remaining enemies has to tick on spawn as well as on
         // kill, otherwise the top-right count lags by one at wave start.
         this.updateEnemiesText();
         return enemy;
     }
 
-    // Each frame, steer every enemy straight toward the player at a fixed speed.
+    // Roll the enemy type for a given wave. Grunt-only before L4, then ramp
+    // tank chance linearly from 20% at L4 to 40% at L10, and hold at 40%
+    // through L14. Levels 15+ aren't called here (boss fight owns spawning).
+    pickEnemyKeyForLevel (level)
+    {
+        if (level < 4) return 'grunt';
+        const tankChance = Math.min(0.4, 0.2 + (level - 4) * (0.2 / 6));
+        return Math.random() < tankChance ? 'tank' : 'grunt';
+    }
+
+    // Each frame, steer every enemy straight toward the player at its own
+    // per-type speed. Speed lives on the sprite (setData in spawnEnemy) so
+    // grunts and tanks share this loop without a type check.
     updateEnemies ()
     {
-        const ENEMY_SPEED = 100;
-
         // getChildren() returns a plain array; slice() mirrors the bullet
         // cleanup pattern and guards against any mid-loop mutation.
         this.enemies.getChildren().slice().forEach((enemy) => {
@@ -857,7 +885,8 @@ export class Game extends Scene
             dx /= length;
             dy /= length;
 
-            enemy.body.setVelocity(dx * ENEMY_SPEED, dy * ENEMY_SPEED);
+            const speed = enemy.getData('speed');
+            enemy.body.setVelocity(dx * speed, dy * speed);
         });
     }
 
@@ -886,8 +915,6 @@ export class Game extends Scene
         enemy.setData('hp', newHp);
         if (newHp <= 0)
         {
-            // Kill SFX. When tougher enemy variants land later, add a
-            // bullet_impact branch in the non-lethal "else" for hit feedback.
             AudioManager.playSfx(this, 'enemy_death');
 
             enemy.destroy();
@@ -900,6 +927,13 @@ export class Game extends Scene
             {
                 this.onWaveCleared();
             }
+        }
+        else
+        {
+            // Non-lethal hit feedback. Only meaningful for tanks (hp=5) and
+            // any future multi-HP variants; grunts (hp=1) always fold into
+            // the lethal branch above.
+            AudioManager.playSfx(this, 'bullet_impact');
         }
     }
 
@@ -987,7 +1021,7 @@ export class Game extends Scene
             const dist = MIN_SPAWN_DIST + Math.random() * (MAX_SPAWN_DIST - MIN_SPAWN_DIST);
             const x = this.player.x + Math.cos(angle) * dist;
             const y = this.player.y + Math.sin(angle) * dist;
-            this.spawnEnemy(x, y);
+            this.spawnEnemy(x, y, this.pickEnemyKeyForLevel(level));
         }
 
         // spawnEnemy already updates the HUD per enemy, but call once more so

@@ -32,6 +32,16 @@ export class MainMenu extends Scene
         this.createStartButton(centerX, 240);
         this.createAudioPanel(centerX);
 
+        // Attribution. Pinned to the camera with setScrollFactor(0) for
+        // consistency with the rest of the HUD-ish elements on this scene
+        // (MainMenu doesn't scroll, but it keeps the pattern uniform).
+        this.add.text(centerX, 720, 'Music: Purple Planet (purple-planet.com)', {
+            fontFamily: 'Arial',
+            fontSize: 14,
+            color: '#666666',
+            align: 'center'
+        }).setOrigin(0.5).setScrollFactor(0);
+
         // Kick off menu music. Phaser auto-unlocks audio on the first user
         // gesture (slider drag, button click, mute toggle -- any of them
         // satisfy the browser's AudioContext gesture requirement).
