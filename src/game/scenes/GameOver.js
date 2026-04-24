@@ -1,4 +1,5 @@
 import { Scene } from 'phaser';
+import { AudioManager } from '../audioManager.js';
 
 export class GameOver extends Scene
 {
@@ -18,6 +19,10 @@ export class GameOver extends Scene
             stroke: '#000000', strokeThickness: 8,
             align: 'center'
         }).setOrigin(0.5);
+
+        // Fade out the game/boss track and bring the menu theme back in so
+        // the death screen doesn't sit under combat music.
+        AudioManager.playMusic(this, 'music_menu');
 
         this.input.once('pointerdown', () => {
 

@@ -1,4 +1,5 @@
 import { Scene } from 'phaser';
+import { AudioManager } from '../audioManager.js';
 
 export class Boot extends Scene
 {
@@ -17,6 +18,11 @@ export class Boot extends Scene
 
     create ()
     {
+        // Load persisted volume/mute settings from localStorage. No scene
+        // reference is stored -- every playSfx/playMusic call passes its
+        // own scene, which sidesteps stale-ref issues on scene teardown.
+        AudioManager.init();
+
         this.scene.start('Preloader');
     }
 }

@@ -6,6 +6,7 @@ import {
     POTION_THROW_SPEED, POTION_MAX_RANGE,
     POTION_PICKUP_RADIUS, POTION_PROJECTILE_RADIUS, POTION_GROUND_RADIUS
 } from '../potions.js';
+import { AudioManager } from '../audioManager.js';
 
 // Healing cadence for the medic's aura. 10 ticks/sec keeps the HUD "HP tick
 // up" feel smooth while keeping per-tick amounts integer for typical
@@ -337,6 +338,10 @@ export class Game extends Scene
         // that when allies exist later, they pick up potions through the same
         // code path. Non-medics can't spawn potions so this is benign today.
         this.physics.add.overlap(this.player, this.potionGroundItems, this.onPickupPotion, null, this);
+
+        // Start game music. Crossfades automatically from the menu track
+        // that's still running from the MainMenu/ClassSelect scenes.
+        AudioManager.playMusic(this, 'music_game');
     }
 
     update ()
@@ -495,6 +500,10 @@ export class Game extends Scene
         const rotation = this.player.rotation;
         const weapon = this.classDef.weapon;
 
+        // One gunshot sound per trigger pull, NOT per bullet. Critical for
+        // the shotgun (6 pellets) so we don't stack 6 overlapping samples.
+        AudioManager.playSfx(this, `gunshot_${weapon}`);
+
         if (weapon === 'pistol' || weapon === 'sniper')
         {
             // Dead straight single shot -- the bullet stats (damage, speed,
@@ -572,6 +581,10 @@ export class Game extends Scene
     // since they're at the aura's center).
     applyHealTick ()
     {
+        // Low volume because this fires every 100ms while right-click is
+        // held; at full volume it becomes an irritating buzz.
+        AudioManager.playSfx(this, 'heal_tick', { volume: 0.3 });
+
         const healPerTick = this.classDef.healPerSecond / 10;
         const radius = this.classDef.healRadius;
         const radiusSq = radius * radius;
@@ -667,6 +680,10 @@ export class Game extends Scene
         proj.body.setVelocity(Math.cos(angle) * POTION_THROW_SPEED, Math.sin(angle) * POTION_THROW_SPEED);
 
         this.potionCooldowns[potionKey] = this.time.now + POTION_COOLDOWN_MS;
+
+        // Success-path only: placed after the cooldown check at the top of
+        // the method returns, so a key spam on cooldown stays silent.
+        AudioManager.playSfx(this, 'potion_throw');
     }
 
     // Step each in-flight potion. When it reaches its stored target (within
@@ -747,6 +764,8 @@ export class Game extends Scene
         // matching the spec: "re-pickup refreshes to 3s".
         this.activeBuffs[potionKey] = this.time.now + POTION_BUFF_DURATION_MS;
         potion.destroy();
+
+        AudioManager.playSfx(this, 'potion_pickup');
     }
 
     // Per-frame HUD update. Only runs for the medic (guarded by the null
@@ -867,6 +886,10 @@ export class Game extends Scene
         enemy.setData('hp', newHp);
         if (newHp <= 0)
         {
+            // Kill SFX. When tougher enemy variants land later, add a
+            // bullet_impact branch in the non-lethal "else" for hit feedback.
+            AudioManager.playSfx(this, 'enemy_death');
+
             enemy.destroy();
             // Refresh the remaining-enemies HUD immediately, then check
             // whether this kill was the last one in the wave. countActive(true)
@@ -900,9 +923,16 @@ export class Game extends Scene
 
         if (this.playerHp <= 0)
         {
+            // Lethal hit: play the death SFX instead of the hit SFX so we
+            // don't stack two sounds on the same frame.
+            AudioManager.playSfx(this, 'player_death');
             // Latch so any further overlap callbacks on this frame are no-ops.
             this.playerDead = true;
             this.scene.start('GameOver');
+        }
+        else
+        {
+            AudioManager.playSfx(this, 'player_hit');
         }
     }
 
@@ -977,6 +1007,10 @@ export class Game extends Scene
         // level" path. Also a no-op if the player died on the killing
         // frame (scene is tearing down).
         if (this.playerDead || this.bossActive) return;
+
+        // After the guards so the SFX only fires on an actual clear, not
+        // on minion deaths during the boss fight.
+        AudioManager.playSfx(this, 'wave_clear');
 
         if (this.currentLevel >= this.lastNormalLevel)
         {
@@ -1062,6 +1096,10 @@ export class Game extends Scene
         this.currentLevel = 15;
         this.updateLevelText();
         this.bossActive = true;
+
+        // Swap music immediately so the boss banner lands with the new
+        // track underneath it.
+        AudioManager.playMusic(this, 'music_boss');
 
         // The enemies counter is replaced by the boss HP bar, so hide it
         // outright rather than repurposing it. The flag gets cleared if we
@@ -1175,6 +1213,7 @@ export class Game extends Scene
                 // Yellow tint = "wind-up". This is the player's only cue
                 // that a high-damage dash is imminent.
                 boss.setTint(0xffff00);
+                AudioManager.playSfx(this, 'boss_telegraph');
             }
         }
         else if (this.bossSlamState === 'telegraphing')
@@ -1194,6 +1233,7 @@ export class Game extends Scene
                 );
                 this.bossDashStartTime = now;
                 this.bossSlamState = 'dashing';
+                AudioManager.playSfx(this, 'boss_slam');
             }
         }
         else if (this.bossSlamState === 'dashing')
@@ -1215,6 +1255,9 @@ export class Game extends Scene
         // --- Radial burst ---------------------------------------------------
         if (now - this.bossLastBurstTime >= BOSS.burstIntervalMs)
         {
+            // One SFX per burst, not per bullet, or we'd stack ~12
+            // overlapping samples.
+            AudioManager.playSfx(this, 'boss_burst');
             for (let i = 0; i < BOSS.burstBulletCount; i++)
             {
                 const angle = (i * Math.PI * 2) / BOSS.burstBulletCount;
@@ -1311,6 +1354,12 @@ export class Game extends Scene
         bullet.setData('consumed', true);
         bullet.destroy();
 
+        // Hit feedback on every bullet (boss has enough HP that this plays
+        // many times per fight, unlike enemies which fold to one hit).
+        // boss_death is NOT played here -- onBossDefeated() owns it so all
+        // teardown sounds live in one place.
+        AudioManager.playSfx(this, 'bullet_impact');
+
         const damage = bullet.getData('damage') || 1;
         const newHp = boss.getData('hp') - damage;
         boss.setData('hp', newHp);
@@ -1339,8 +1388,13 @@ export class Game extends Scene
 
         if (this.playerHp <= 0)
         {
+            AudioManager.playSfx(this, 'player_death');
             this.playerDead = true;
             this.scene.start('GameOver');
+        }
+        else
+        {
+            AudioManager.playSfx(this, 'player_hit');
         }
     }
 
@@ -1363,8 +1417,13 @@ export class Game extends Scene
 
         if (this.playerHp <= 0)
         {
+            AudioManager.playSfx(this, 'player_death');
             this.playerDead = true;
             this.scene.start('GameOver');
+        }
+        else
+        {
+            AudioManager.playSfx(this, 'player_hit');
         }
     }
 
@@ -1374,6 +1433,8 @@ export class Game extends Scene
     onBossDefeated ()
     {
         this.bossActive = false;
+
+        AudioManager.playSfx(this, 'boss_death');
 
         if (this.boss) { this.boss.destroy(); this.boss = null; }
         if (this.bossLabel) this.bossLabel.destroy();

@@ -1,5 +1,6 @@
 import { Scene } from 'phaser';
 import { CLASSES, DEFAULT_CLASS_KEY } from '../classes.js';
+import { AudioManager } from '../audioManager.js';
 
 // Shown once the player defeats the level 15 boss. Pure UI scene -- no
 // physics, no input beyond "click to return". Class key is passed in from
@@ -77,6 +78,11 @@ export class Victory extends Scene
             stroke: '#000000',
             strokeThickness: 3
         }).setOrigin(0.5);
+
+        // Victory sting + return to menu theme. playMusic crossfades from
+        // whatever was still playing (music_boss) into music_menu.
+        AudioManager.playSfx(this, 'victory');
+        AudioManager.playMusic(this, 'music_menu');
 
         // once() (not on()) so we don't double-fire if the user mashes
         // during the scene transition.

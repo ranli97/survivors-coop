@@ -33,6 +33,29 @@ export class Preloader extends Scene
         this.load.setPath('assets');
 
         this.load.image('logo', 'logo.png');
+
+        // Audio.
+        // Keys intentionally match the filenames (minus extension) so the
+        // cache-key used by AudioManager is predictable at call sites.
+        // Missing files fire 'loaderror' below and then fail gracefully at
+        // playback time via AudioManager's cache.audio.exists() check.
+        const SFX_KEYS = [
+            'gunshot_shotgun', 'gunshot_sniper', 'gunshot_mg', 'gunshot_pistol',
+            'bullet_impact', 'enemy_death', 'player_hit',
+            'heal_tick', 'potion_throw', 'potion_pickup',
+            'boss_telegraph', 'boss_slam', 'boss_burst', 'boss_death',
+            'player_death', 'wave_clear', 'victory'
+        ];
+        const MUSIC_KEYS = ['music_menu', 'music_game', 'music_boss'];
+
+        // Register the error handler BEFORE queueing the loads so it catches
+        // everything (Phaser fires loaderror synchronously during the load).
+        this.load.on('loaderror', (file) => {
+            console.warn(`[Preloader] Failed to load: ${file.key} (${file.src})`);
+        });
+
+        for (const k of SFX_KEYS)   this.load.audio(k, `audio/sfx/${k}.ogg`);
+        for (const k of MUSIC_KEYS) this.load.audio(k, `audio/music/${k}.mp3`);
     }
 
     create ()
