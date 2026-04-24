@@ -12,6 +12,36 @@ import {
 // healPerSecond values (e.g. 10 -> 1 HP per tick).
 const HEAL_TICK_MS = 100;
 
+// Level 15 boss tunables. One config object keeps every magic number next to
+// its siblings -- tuning the fight is a single-file edit with no grepping.
+// color_nub is baked in rather than derived via darkenColor() so the boss
+// texture setup stays a single call.
+const BOSS = {
+    hp: 2000,
+    radius: 60,
+    color: 0x9933ff,
+    color_nub: 0x5511aa,
+    chaseSpeed: 80,
+    // Slam cadence: telegraph -> dash -> idle cooldown all measured from the
+    // end of the previous slam, so the player always gets at least
+    // slamIntervalMs of recovery between attacks.
+    slamIntervalMs: 4000,
+    slamTelegraphMs: 1000,
+    slamDashSpeed: 500,
+    slamDashDurationMs: 500,
+    slamDamage: 40,
+    slamContactCooldownMs: 1000,
+    burstIntervalMs: 6000,
+    burstBulletCount: 8,
+    burstBulletSpeed: 250,
+    burstBulletDamage: 10,
+    burstBulletRange: 1500,
+    burstBulletRadius: 6,
+    minionSpawnIntervalMs: 10000,
+    minionsPerSpawn: 3,
+    minionCap: 10
+};
+
 // Gameplay scene: sets up a large world, the player, WASD movement,
 // and a camera that follows the player.
 export class Game extends Scene
@@ -189,6 +219,11 @@ export class Game extends Scene
         // hits 0, which would queue up multiple scene transitions. This flag
         // makes sure damage + scene.start each happen at most once.
         this.playerDead = false;
+
+        // Flipped by startBossLevel() when level 14 is cleared and flipped
+        // off by onBossDefeated(). While true, the minion-spawn branch of
+        // onWaveCleared() is suppressed and update() runs the boss pipeline.
+        this.bossActive = false;
 
         // --- HUD ------------------------------------------------------------------
         // HP text pinned to the top-left of the screen. setScrollFactor(0)
@@ -400,6 +435,18 @@ export class Game extends Scene
         // --- Enemies --------------------------------------------------------------
         // Chase logic is in a helper to keep update() readable.
         this.updateEnemies();
+
+        // --- Boss -----------------------------------------------------------------
+        // Only runs during level 15. All three calls inspect live boss state
+        // so the `.active` guard prevents ticking the state machine on the
+        // frame after a kill (between onBossDefeated() destroying the sprite
+        // and this.bossActive being flipped off).
+        if (this.bossActive && this.boss && this.boss.active)
+        {
+            this.updateBoss();
+            this.updateBossBullets();
+            this.updateBossBar();
+        }
     }
 
     // --- Helpers -----------------------------------------------------------------
@@ -797,10 +844,18 @@ export class Game extends Scene
 
     // Bullet overlapping an enemy: consume the bullet, take 1 hp off the
     // enemy, and destroy it if hp has reached zero.
+    //
+    // We short-circuit on a 'consumed' data flag rather than !bullet.active
+    // because Arcade Physics can re-invoke this callback for the same
+    // (bullet, enemy) pair within the same tick -- bullet.destroy() doesn't
+    // synchronously stop the already-queued overlap resolution. The data
+    // flag is set *before* destroy so the very next callback entry bails
+    // out cleanly. Masked on enemies today (hp=1) but matters for the boss.
     onBulletHitEnemy (bullet, enemy)
     {
-        if (!bullet.active || !enemy.active) return;
+        if (bullet.getData('consumed') || !enemy.active) return;
 
+        bullet.setData('consumed', true);
         bullet.destroy();
 
         // Each bullet carries its own damage value (shotgun pellet 15, sniper
@@ -911,15 +966,33 @@ export class Game extends Scene
         this.updateEnemiesText();
     }
 
-    // Called the moment the last enemy in the current wave is destroyed.
-    // Advances to the next level after a short intermission, or logs a
-    // placeholder if we've just cleared the last normal level (boss slot).
+    // Called the moment the last living member of this.enemies is destroyed.
+    // For levels 1-13 this advances to the next wave; clearing level 14
+    // routes into the boss fight. During the boss fight this fires on every
+    // minion's death but the bossActive guard makes it a no-op.
     onWaveCleared ()
     {
+        // Boss fight owns its own end conditions; minion kills during
+        // level 15 must not re-trigger the normal "wave cleared -> next
+        // level" path. Also a no-op if the player died on the killing
+        // frame (scene is tearing down).
+        if (this.playerDead || this.bossActive) return;
+
         if (this.currentLevel >= this.lastNormalLevel)
         {
-            // Level 15 is the reserved boss slot -- not implemented yet.
-            console.log('Boss level would start here');
+            // Level 14 cleared -> advance into the boss after the same 3s
+            // intermission used between normal waves, so the pacing stays
+            // consistent. The banner text is the only thing that differs.
+            this.currentLevel = this.lastNormalLevel + 1;
+            this.showBanner(
+                `Level ${this.lastNormalLevel} Cleared!`,
+                'Boss incoming...',
+                this.intermissionMs
+            );
+            this.time.delayedCall(this.intermissionMs, () => {
+                if (this.playerDead) return;
+                this.startBossLevel();
+            });
             return;
         }
 
@@ -977,6 +1050,352 @@ export class Game extends Scene
         this.time.delayedCall(durationMs, () => {
             if (top && top.active) top.destroy();
             if (bottom && bottom.active) bottom.destroy();
+        });
+    }
+
+    // Kick off the level 15 boss encounter. Called from onWaveCleared() after
+    // the level-14 intermission. Sets the "we're in the boss fight" flag,
+    // swaps in boss-specific HUD, spawns the boss, and registers the three
+    // boss-specific overlaps.
+    startBossLevel ()
+    {
+        this.currentLevel = 15;
+        this.updateLevelText();
+        this.bossActive = true;
+
+        // The enemies counter is replaced by the boss HP bar, so hide it
+        // outright rather than repurposing it. The flag gets cleared if we
+        // ever need to show it again (we don't in the current scope).
+        this.enemiesText.setVisible(false);
+
+        this.showBanner('BOSS FIGHT', 'Defeat the Purple Menace', 2000);
+
+        // Reuse createPlayerTexture so the boss gets the same directional
+        // nub as the player (rotation is visible, same as regular enemies
+        // would look if they rotated). Guarded so reruns don't rebuild it.
+        if (!this.textures.exists('boss'))
+        {
+            this.createPlayerTexture('boss', BOSS.radius, BOSS.color, BOSS.color_nub);
+        }
+
+        // Spawn at a deterministic offset from world center. Keeps the fight
+        // from starting inside the player's face on respawn.
+        const spawnX = this.worldWidth / 2 + 400;
+        const spawnY = this.worldHeight / 2;
+
+        this.boss = this.physics.add.sprite(spawnX, spawnY, 'boss');
+        this.boss.body.setCircle(BOSS.radius);
+        this.boss.setCollideWorldBounds(true);
+        this.boss.setData('hp', BOSS.hp);
+        this.boss.setData('maxHp', BOSS.hp);
+        // Reuses the per-enemy contact-damage-cooldown pattern: the last
+        // time this boss dealt touch damage, in ms since scene start.
+        this.boss.setData('lastHitTime', 0);
+
+        // Timers start at scene time so the first slam/burst/spawn fires
+        // after a full interval, not instantly at boss spawn.
+        this.bossLastSlamTime = this.time.now;
+        this.bossLastBurstTime = this.time.now;
+        this.bossLastMinionSpawnTime = this.time.now;
+        // State machine: idle -> telegraphing -> dashing -> idle.
+        this.bossSlamState = 'idle';
+
+        // Boss bullet group + texture. Lighter purple than the boss itself
+        // so the projectiles stay visible against the 0x1a1a1a floor.
+        this.bossBullets = this.physics.add.group();
+        if (!this.textures.exists('bossBullet'))
+        {
+            this.createCircleTexture('bossBullet', BOSS.burstBulletRadius, 0xaa66ff);
+        }
+
+        // HP bar UI. 600px wide top-center, all pinned to the camera so it
+        // doesn't scroll with the world. Stored on `this` because
+        // onBossDefeated() needs to tear them down.
+        this.bossLabel = this.add.text(this.scale.width / 2, 50, 'BOSS', {
+            fontFamily: 'Arial Black', fontSize: 22,
+            color: '#ffffff', stroke: '#000000', strokeThickness: 4
+        }).setOrigin(0.5, 0).setScrollFactor(0);
+
+        const barWidth = 600;
+        const barHeight = 20;
+        const barX = (this.scale.width - barWidth) / 2;
+        const barY = 80;
+
+        this.bossBarBg = this.add.rectangle(barX, barY, barWidth, barHeight, 0x333333)
+            .setOrigin(0, 0).setScrollFactor(0).setStrokeStyle(2, 0xffffff);
+        this.bossBarFill = this.add.rectangle(barX, barY, barWidth, barHeight, BOSS.color)
+            .setOrigin(0, 0).setScrollFactor(0);
+        this.bossBarWidth = barWidth;
+
+        // Register overlaps. Using overlap (not collider) so the boss
+        // doesn't physically shove the player on contact -- the slam's
+        // threat is the damage value, not the shove.
+        this.physics.add.overlap(this.bullets, this.boss, this.onBulletHitBoss, null, this);
+        this.physics.add.overlap(this.player, this.boss, this.onBossTouchPlayer, null, this);
+        this.physics.add.overlap(this.player, this.bossBullets, this.onBossBulletHitPlayer, null, this);
+    }
+
+    // Per-frame boss behavior. Runs from update() only while bossActive and
+    // boss.active. Rotates the boss to face the player, ticks the slam state
+    // machine, and fires timed burst/minion attacks.
+    updateBoss ()
+    {
+        const boss = this.boss;
+        const player = this.player;
+        const now = this.time.now;
+
+        // Face the player every frame so the directional nub always points
+        // at them. This is cosmetic outside the dash; during telegraph
+        // you see the nub track toward where the dash will commit.
+        boss.rotation = Math.atan2(player.y - boss.y, player.x - boss.x);
+
+        // --- Slam state machine ---------------------------------------------
+        if (this.bossSlamState === 'idle')
+        {
+            // Chase at chaseSpeed, same normalize pattern as regular enemies.
+            let dx = player.x - boss.x;
+            let dy = player.y - boss.y;
+            const len = Math.sqrt(dx * dx + dy * dy);
+            if (len === 0)
+            {
+                boss.body.setVelocity(0, 0);
+            }
+            else
+            {
+                dx /= len;
+                dy /= len;
+                boss.body.setVelocity(dx * BOSS.chaseSpeed, dy * BOSS.chaseSpeed);
+            }
+
+            if (now - this.bossLastSlamTime >= BOSS.slamIntervalMs)
+            {
+                this.bossSlamState = 'telegraphing';
+                this.bossTelegraphStartTime = now;
+                boss.body.setVelocity(0, 0);
+                // Yellow tint = "wind-up". This is the player's only cue
+                // that a high-damage dash is imminent.
+                boss.setTint(0xffff00);
+            }
+        }
+        else if (this.bossSlamState === 'telegraphing')
+        {
+            // Stay still during the wind-up; the dash angle is locked at the
+            // end of telegraph, not at the start, so the player can still
+            // dodge by moving during the yellow-tint window.
+            boss.body.setVelocity(0, 0);
+
+            if (now - this.bossTelegraphStartTime >= BOSS.slamTelegraphMs)
+            {
+                boss.clearTint();
+                this.bossDashAngle = Math.atan2(player.y - boss.y, player.x - boss.x);
+                boss.body.setVelocity(
+                    Math.cos(this.bossDashAngle) * BOSS.slamDashSpeed,
+                    Math.sin(this.bossDashAngle) * BOSS.slamDashSpeed
+                );
+                this.bossDashStartTime = now;
+                this.bossSlamState = 'dashing';
+            }
+        }
+        else if (this.bossSlamState === 'dashing')
+        {
+            // Velocity was set at the transition into 'dashing' and we
+            // intentionally don't re-aim mid-dash -- that's what makes it
+            // dodgeable. When the duration is up, stop and begin recovery.
+            if (now - this.bossDashStartTime >= BOSS.slamDashDurationMs)
+            {
+                boss.body.setVelocity(0, 0);
+                this.bossSlamState = 'idle';
+                // Recovery timer starts from the end of the dash so the
+                // next telegraph is slamIntervalMs later, not
+                // slamIntervalMs - dashDuration - telegraphMs later.
+                this.bossLastSlamTime = now;
+            }
+        }
+
+        // --- Radial burst ---------------------------------------------------
+        if (now - this.bossLastBurstTime >= BOSS.burstIntervalMs)
+        {
+            for (let i = 0; i < BOSS.burstBulletCount; i++)
+            {
+                const angle = (i * Math.PI * 2) / BOSS.burstBulletCount;
+                this.fireBossBullet(angle);
+            }
+            this.bossLastBurstTime = now;
+        }
+
+        // --- Minion spawn ---------------------------------------------------
+        if (now - this.bossLastMinionSpawnTime >= BOSS.minionSpawnIntervalMs &&
+            this.enemies.countActive(true) < BOSS.minionCap)
+        {
+            for (let i = 0; i < BOSS.minionsPerSpawn; i++)
+            {
+                const angle = Math.random() * Math.PI * 2;
+                const dist = 100 + Math.random() * 100;
+                const mx = boss.x + Math.cos(angle) * dist;
+                const my = boss.y + Math.sin(angle) * dist;
+                this.spawnEnemy(mx, my);
+            }
+            this.bossLastMinionSpawnTime = now;
+        }
+    }
+
+    // Spawn one bullet from the boss at the supplied absolute angle.
+    // Mirrors fireSingleBullet's setData shape (spawnX/Y/rangeSq) so the
+    // cleanup logic in updateBossBullets() is a straight copy.
+    fireBossBullet (angle)
+    {
+        const boss = this.boss;
+        const bullet = this.bossBullets.create(boss.x, boss.y, 'bossBullet');
+        bullet.body.setCircle(BOSS.burstBulletRadius);
+        bullet.body.setVelocity(
+            Math.cos(angle) * BOSS.burstBulletSpeed,
+            Math.sin(angle) * BOSS.burstBulletSpeed
+        );
+        bullet.setData('spawnX', boss.x);
+        bullet.setData('spawnY', boss.y);
+        bullet.setData('rangeSq', BOSS.burstBulletRange * BOSS.burstBulletRange);
+    }
+
+    // Cleanup for boss bullets -- same shape as the player-bullet cleanup in
+    // update(), just over its own group. Destroys any that have exceeded
+    // their range or left the world.
+    updateBossBullets ()
+    {
+        this.bossBullets.getChildren().slice().forEach((bullet) => {
+            if (!bullet || !bullet.active) return;
+
+            const bdx = bullet.x - bullet.getData('spawnX');
+            const bdy = bullet.y - bullet.getData('spawnY');
+            const travelledSq = bdx * bdx + bdy * bdy;
+            const maxDistSq = bullet.getData('rangeSq');
+
+            const outOfWorld =
+                bullet.x < 0 || bullet.x > this.worldWidth ||
+                bullet.y < 0 || bullet.y > this.worldHeight;
+
+            if (travelledSq > maxDistSq || outOfWorld)
+            {
+                bullet.destroy();
+            }
+        });
+    }
+
+    // Scale the HP bar fill to match the boss's remaining HP. Ratio is
+    // clamped to 0 so a negative-HP killing blow doesn't produce a negative
+    // width for the single frame before onBossDefeated() tears the bar down.
+    updateBossBar ()
+    {
+        const ratio = Math.max(0, this.boss.getData('hp') / this.boss.getData('maxHp'));
+        this.bossBarFill.width = this.bossBarWidth * ratio;
+    }
+
+    // Player bullet hits the boss. Mirrors onBulletHitEnemy but with the
+    // boss's setData hp/maxHp and no wave-clear plumbing; when HP reaches 0
+    // we dispatch to onBossDefeated() which owns the full teardown.
+    //
+    // Uses the same 'consumed' flag pattern as onBulletHitEnemy -- see the
+    // comment there for the rationale. The boss is the first entity with >1
+    // HP, which is why this bug was invisible until level 15.
+    //
+    // IMPORTANT: arg order is (boss, bullet), NOT (bullet, boss). Phaser's
+    // collideSpriteVsGroup(spriteSide, groupSide, cb) always invokes cb with
+    // the single sprite first, regardless of the order passed to overlap().
+    // We register overlap(this.bullets, this.boss, ...), so Phaser routes it
+    // as collideSpriteVsGroup(boss, bullets) internally and the callback
+    // receives (boss, bullet). onBulletHitEnemy is unaffected because both
+    // of its sides are groups (collideGroupVsGroup honors registration order).
+    onBulletHitBoss (boss, bullet)
+    {
+        if (bullet.getData('consumed') || !boss.active) return;
+
+        bullet.setData('consumed', true);
+        bullet.destroy();
+
+        const damage = bullet.getData('damage') || 1;
+        const newHp = boss.getData('hp') - damage;
+        boss.setData('hp', newHp);
+
+        if (newHp <= 0)
+        {
+            this.onBossDefeated();
+        }
+    }
+
+    // Boss body overlapping the player. Damage is a flat slamDamage (40)
+    // whether the boss is chasing or dashing -- the dash just makes it
+    // easier to land the hit. Respects a per-boss cooldown so continuous
+    // contact doesn't drain the player's HP in a single frame.
+    onBossTouchPlayer (player, boss)
+    {
+        if (this.playerDead || !boss.active) return;
+
+        const now = this.time.now;
+        if (now - boss.getData('lastHitTime') < BOSS.slamContactCooldownMs) return;
+        boss.setData('lastHitTime', now);
+
+        this.playerHp -= BOSS.slamDamage;
+        this.updateHpText();
+        this.flashPlayerHit();
+
+        if (this.playerHp <= 0)
+        {
+            this.playerDead = true;
+            this.scene.start('GameOver');
+        }
+    }
+
+    // A boss bullet hit the player. Each bullet is one-shot -- destroy on
+    // contact so the player can't get ticked twice by the same projectile.
+    // Uses the same 'consumed' flag pattern as onBulletHitEnemy /
+    // onBulletHitBoss so a bullet that overlaps the player for multiple
+    // physics steps doesn't drain HP repeatedly.
+    onBossBulletHitPlayer (player, bullet)
+    {
+        if (this.playerDead) return;
+        if (bullet.getData('consumed')) return;
+
+        bullet.setData('consumed', true);
+        bullet.destroy();
+
+        this.playerHp -= BOSS.burstBulletDamage;
+        this.updateHpText();
+        this.flashPlayerHit();
+
+        if (this.playerHp <= 0)
+        {
+            this.playerDead = true;
+            this.scene.start('GameOver');
+        }
+    }
+
+    // Boss HP reached 0. Clear the fight state, destroy every boss-related
+    // entity + HUD element, show a victory banner, and queue a transition
+    // to GameOver. A proper Victory scene replaces the GameOver hand-off in
+    // a later step; the console.log is the breadcrumb for that change.
+    onBossDefeated ()
+    {
+        this.bossActive = false;
+
+        if (this.boss) { this.boss.destroy(); this.boss = null; }
+        if (this.bossLabel) this.bossLabel.destroy();
+        if (this.bossBarBg) this.bossBarBg.destroy();
+        if (this.bossBarFill) this.bossBarFill.destroy();
+
+        // Remove living minions + in-flight boss bullets so the victory
+        // banner isn't accompanied by red enemies still chasing or purple
+        // bullets still flying.
+        this.enemies.getChildren().slice().forEach(e => e.destroy());
+        if (this.bossBullets) this.bossBullets.getChildren().slice().forEach(b => b.destroy());
+
+        this.showBanner('VICTORY!', 'You have defeated the Purple Menace', 3000);
+        console.log('BOSS DEFEATED -- victory scene coming in Step E');
+
+        // playerDead guard: the victory transition fires 3s after the boss
+        // dies, during which the player can still be touched by a leftover
+        // minion spawned on the same frame. If that kills them, the
+        // GameOver scene is already running and we skip the duplicate.
+        this.time.delayedCall(3000, () => {
+            if (!this.playerDead) this.scene.start('GameOver');
         });
     }
 
