@@ -17,7 +17,7 @@ const phasermsg = () => {
 }   
 
 export default defineConfig({
-    base: './',
+    base: '/survivors-coop/',
     logLevel: 'warn',
     build: {
         rollupOptions: {
