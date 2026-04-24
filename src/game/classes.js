@@ -73,7 +73,13 @@ export const CLASSES = {
         fireRateMs: 250,
         bulletDamage: 8,
         bulletSpeed: 600,
-        bulletRange: 500
+        bulletRange: 500,
+        // Healing aura -- exclusive to the medic. The gameplay scene checks
+        // `canHeal === true` before running any healing logic, so omitting
+        // these fields on other classes is what keeps RMB inert for them.
+        canHeal: true,
+        healRadius: 150,
+        healPerSecond: 10
     }
 };
 

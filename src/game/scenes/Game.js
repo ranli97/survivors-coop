@@ -1,6 +1,11 @@
 import { Scene } from 'phaser';
 import { CLASSES, DEFAULT_CLASS_KEY } from '../classes.js';
 
+// Healing cadence for the medic's aura. 10 ticks/sec keeps the HUD "HP tick
+// up" feel smooth while keeping per-tick amounts integer for typical
+// healPerSecond values (e.g. 10 -> 1 HP per tick).
+const HEAL_TICK_MS = 100;
+
 // Gameplay scene: sets up a large world, the player, WASD movement,
 // and a camera that follows the player.
 export class Game extends Scene
@@ -85,10 +90,40 @@ export class Game extends Scene
         // A circular hit area matches the visual (default is a rectangle).
         this.player.body.setCircle(PLAYER_RADIUS);
 
+        // --- Healing aura (medic only) -------------------------------------------
+        // isHealing/lastHealTickTime are tracked for every class so update()
+        // can gate firing on them uniformly. The aura graphic and any real
+        // healing effect are gated behind classDef.canHeal -- non-medic
+        // classes end up with this.healAura = null and never touch it.
+        this.isHealing = false;
+        this.lastHealTickTime = 0;
+
+        if (this.classDef.canHeal === true)
+        {
+            const r = this.classDef.healRadius;
+            this.healAura = this.add.graphics();
+            // Semi-transparent green fill + brighter edge stroke so the
+            // radius is visible even when the fill blends with the floor.
+            this.healAura.fillStyle(0x44ff44, 0.15);
+            this.healAura.fillCircle(0, 0, r);
+            this.healAura.lineStyle(2, 0x44ff44, 0.6);
+            this.healAura.strokeCircle(0, 0, r);
+            this.healAura.setVisible(false);
+        }
+        else
+        {
+            this.healAura = null;
+        }
+
         // --- Input ---------------------------------------------------------------
         // WASD keys via Phaser's string-based registration (no KeyCodes needed).
         // Access with this.keys.W.isDown, this.keys.A.isDown, etc.
         this.keys = this.input.keyboard.addKeys('W,A,S,D');
+
+        // Without this, right-clicking inside the canvas pops the browser's
+        // context menu, which both breaks flow and swallows the RMB event we
+        // need for the medic's heal.
+        this.input.mouse.disableContextMenu();
 
         // --- Camera follow --------------------------------------------------------
         // The 0.1 lerp values make the camera ease toward the player rather than
@@ -146,6 +181,18 @@ export class Game extends Scene
             strokeThickness: 3
         }).setScrollFactor(0);
 
+        // Healing indicator -- only ever populated by updateHealing() for the
+        // medic. For other classes it lives here silently (always empty) so
+        // the HUD layout stays consistent and updateHealing can write into
+        // it without a null guard.
+        this.healingText = this.add.text(16, 68, '', {
+            fontFamily: 'Arial Black',
+            fontSize: 18,
+            color: '#44ff44',
+            stroke: '#000000',
+            strokeThickness: 3
+        }).setScrollFactor(0);
+
         // Level readout (top-center). Same font family as hpText so the HUD
         // reads as a single visual group.
         this.levelText = this.add.text(this.scale.width / 2, 16, '', {
@@ -186,6 +233,11 @@ export class Game extends Scene
 
     update ()
     {
+        // Healing first, so the "are we healing?" flag is authoritative
+        // before any movement/fire logic reads it. WASD/aim still run
+        // regardless of healing state below; only firing is gated.
+        this.updateHealing();
+
         // Per-class movement speed (medic 220 > brawler/gunner 200 > sniper 180).
         const SPEED = this.classDef.speed;
         const body = this.player.body;
@@ -226,7 +278,12 @@ export class Game extends Scene
         // itself dispatches on weapon type -- one call = "one trigger pull",
         // which for the shotgun means a full pellet spread.
         const FIRE_INTERVAL_MS = this.classDef.fireRateMs;
-        if (pointer.leftButtonDown() && this.time.now - this.lastFireTime >= FIRE_INTERVAL_MS)
+        // Holding RMB to heal suppresses firing -- medic can't do both at
+        // once. For non-medic classes isHealing is always false, so this
+        // extra check is a no-op for them.
+        if (!this.isHealing &&
+            pointer.leftButtonDown() &&
+            this.time.now - this.lastFireTime >= FIRE_INTERVAL_MS)
         {
             this.fireWeapon();
             this.lastFireTime = this.time.now;
@@ -335,6 +392,76 @@ export class Game extends Scene
                 this.fireSingleBullet(rotation + offset);
             }
             return;
+        }
+    }
+
+    // Medic-only aura update. For any class without canHeal this is a no-op
+    // that just pins isHealing=false and hides the aura if one somehow
+    // exists. Called at the top of update() so the flag is authoritative by
+    // the time the fire gate reads it.
+    updateHealing ()
+    {
+        if (this.classDef.canHeal !== true)
+        {
+            this.isHealing = false;
+            if (this.healAura) this.healAura.setVisible(false);
+            return;
+        }
+
+        const rmb = this.input.activePointer.rightButtonDown();
+        this.isHealing = rmb;
+
+        if (rmb)
+        {
+            // Follow the player each frame so the aura stays centered while
+            // moving with WASD (aura graphic was drawn at local (0, 0)).
+            this.healAura.setPosition(this.player.x, this.player.y).setVisible(true);
+            this.healingText.setText('HEALING');
+
+            if (this.time.now - this.lastHealTickTime >= HEAL_TICK_MS)
+            {
+                this.applyHealTick();
+                this.lastHealTickTime = this.time.now;
+            }
+        }
+        else
+        {
+            this.healAura.setVisible(false);
+            this.healingText.setText('');
+        }
+    }
+
+    // Apply one tick's worth of healing to every friendly target inside the
+    // aura. Targets are collected into a local array so that adding
+    // `this.allies` later is a one-line change -- the distance + heal logic
+    // works identically for medic and allies (medic is trivially in range
+    // since they're at the aura's center).
+    applyHealTick ()
+    {
+        const healPerTick = this.classDef.healPerSecond / 10;
+        const radius = this.classDef.healRadius;
+        const radiusSq = radius * radius;
+
+        const targets = [];
+        targets.push(this.player);
+        // Future multiplayer:
+        //   if (this.allies) this.allies.getChildren().forEach((a) => targets.push(a));
+
+        for (const target of targets)
+        {
+            const dx = target.x - this.player.x;
+            const dy = target.y - this.player.y;
+            if (dx * dx + dy * dy > radiusSq) continue;
+
+            if (target === this.player)
+            {
+                // Clamp to max HP, then round so the HUD never shows e.g.
+                // "HP: 99.9". For spec values (+1/tick) this is a no-op.
+                const healed = Math.min(this.playerMaxHp, this.playerHp + healPerTick);
+                this.playerHp = Math.round(healed);
+                this.updateHpText();
+            }
+            // Future ally branch: read maxHp off setData and clamp identically.
         }
     }
 
