@@ -11,6 +11,21 @@ export class Game extends Scene
 
     create ()
     {
+        // --- Level/wave constants -------------------------------------------------
+        // Levels 1..14 are the normal survival loop. Level 15 is reserved for a
+        // future boss fight; when the player clears level 14 we just log a
+        // placeholder for now.
+        const FIRST_LEVEL = 1;
+        const LAST_NORMAL_LEVEL = 14;
+        const INTERMISSION_MS = 3000;
+
+        // Exposed so onWaveCleared() can read/enforce the cap without having to
+        // re-declare the constant.
+        this.lastNormalLevel = LAST_NORMAL_LEVEL;
+        this.intermissionMs = INTERMISSION_MS;
+
+        this.currentLevel = FIRST_LEVEL;
+
         // --- World + camera setup -------------------------------------------------
         const WORLD_WIDTH = 2000;
         const WORLD_HEIGHT = 2000;
@@ -101,6 +116,26 @@ export class Game extends Scene
         }).setScrollFactor(0);
         this.updateHpText();
 
+        // Level readout (top-center). Same font family as hpText so the HUD
+        // reads as a single visual group.
+        this.levelText = this.add.text(this.scale.width / 2, 16, '', {
+            fontFamily: 'Arial Black',
+            fontSize: 24,
+            color: '#ffffff',
+            stroke: '#000000',
+            strokeThickness: 4
+        }).setOrigin(0.5, 0).setScrollFactor(0);
+
+        // Remaining-enemies readout (top-right). Origin (1, 0) anchors its
+        // right edge to (width - 16, 16) so the text grows leftward.
+        this.enemiesText = this.add.text(this.scale.width - 16, 16, '', {
+            fontFamily: 'Arial Black',
+            fontSize: 24,
+            color: '#ffffff',
+            stroke: '#000000',
+            strokeThickness: 4
+        }).setOrigin(1, 0).setScrollFactor(0);
+
         // --- Enemies --------------------------------------------------------------
         // Physics group that owns every enemy. Members get dynamic Arcade bodies.
         this.enemies = this.physics.add.group();
@@ -108,20 +143,9 @@ export class Game extends Scene
         // Red circle texture (reuses the same helper the player/bullet use).
         this.createCircleTexture('enemy', 14, 0xdd3333);
 
-        // Spawn 5 enemies scattered around the player in a 300-600 px ring at
-        // random angles -- so they appear surrounding the player rather than
-        // clustered on one side, and none spawn on top of the player.
-        const ENEMY_COUNT = 5;
-        const MIN_SPAWN_DIST = 300;
-        const MAX_SPAWN_DIST = 600;
-        for (let i = 0; i < ENEMY_COUNT; i++)
-        {
-            const angle = Math.random() * Math.PI * 2;
-            const dist = MIN_SPAWN_DIST + Math.random() * (MAX_SPAWN_DIST - MIN_SPAWN_DIST);
-            const x = this.player.x + Math.cos(angle) * dist;
-            const y = this.player.y + Math.sin(angle) * dist;
-            this.spawnEnemy(x, y);
-        }
+        // Kick off the first wave. The ring-spawn math that used to live here
+        // has moved into startLevel() so every level can reuse it.
+        this.startLevel(this.currentLevel);
 
         // --- Combat overlaps ------------------------------------------------------
         // overlap (not collider) so enemies don't physically push the player --
@@ -247,6 +271,9 @@ export class Game extends Scene
         // variants just pass a higher starting hp).
         enemy.setData('hp', 1);
         enemy.setData('lastHitTime', 0);
+        // HUD readout of remaining enemies has to tick on spawn as well as on
+        // kill, otherwise the top-right count lags by one at wave start.
+        this.updateEnemiesText();
         return enemy;
     }
 
@@ -292,6 +319,15 @@ export class Game extends Scene
         if (newHp <= 0)
         {
             enemy.destroy();
+            // Refresh the remaining-enemies HUD immediately, then check
+            // whether this kill was the last one in the wave. countActive(true)
+            // only counts living group members, so the destroyed enemy above is
+            // already excluded.
+            this.updateEnemiesText();
+            if (this.enemies.countActive(true) === 0)
+            {
+                this.onWaveCleared();
+            }
         }
     }
 
@@ -340,6 +376,114 @@ export class Game extends Scene
     updateHpText ()
     {
         this.hpText.setText(`HP: ${this.playerHp}`);
+    }
+
+    // Refresh the top-center level readout.
+    updateLevelText ()
+    {
+        this.levelText.setText(`Level ${this.currentLevel}`);
+    }
+
+    // Refresh the top-right remaining-enemies readout. countActive(true) only
+    // counts living group members, which is exactly what we want.
+    updateEnemiesText ()
+    {
+        this.enemiesText.setText(`Enemies: ${this.enemies.countActive(true)}`);
+    }
+
+    // Kick off a wave: update HUD, flash a "Level N" banner, then spawn
+    // 5 + (level - 1) * 2 enemies in the same 300-600 px ring around the
+    // player that create() originally used for its 5-enemy starter group.
+    startLevel (level)
+    {
+        this.updateLevelText();
+        this.showBanner(`Level ${level}`, '', 1500);
+
+        const enemyCount = 5 + (level - 1) * 2;
+        const MIN_SPAWN_DIST = 300;
+        const MAX_SPAWN_DIST = 600;
+        for (let i = 0; i < enemyCount; i++)
+        {
+            const angle = Math.random() * Math.PI * 2;
+            const dist = MIN_SPAWN_DIST + Math.random() * (MAX_SPAWN_DIST - MIN_SPAWN_DIST);
+            const x = this.player.x + Math.cos(angle) * dist;
+            const y = this.player.y + Math.sin(angle) * dist;
+            this.spawnEnemy(x, y);
+        }
+
+        // spawnEnemy already updates the HUD per enemy, but call once more so
+        // the count is authoritative in the (future) edge case where a wave
+        // starts with zero enemies.
+        this.updateEnemiesText();
+    }
+
+    // Called the moment the last enemy in the current wave is destroyed.
+    // Advances to the next level after a short intermission, or logs a
+    // placeholder if we've just cleared the last normal level (boss slot).
+    onWaveCleared ()
+    {
+        if (this.currentLevel >= this.lastNormalLevel)
+        {
+            // Level 15 is the reserved boss slot -- not implemented yet.
+            console.log('Boss level would start here');
+            return;
+        }
+
+        const cleared = this.currentLevel;
+        this.currentLevel = cleared + 1;
+
+        this.showBanner(
+            `Level ${cleared} Cleared!`,
+            'Next wave in 3...',
+            this.intermissionMs
+        );
+
+        // playerDead guard: if the player dies during the intermission, the
+        // scene has already transitioned to GameOver. Starting a new wave
+        // here would spawn enemies into a scene that's tearing down.
+        this.time.delayedCall(this.intermissionMs, () => {
+            if (this.playerDead) return;
+            this.startLevel(this.currentLevel);
+        });
+    }
+
+    // Fullscreen-centered two-line banner. Both lines are pinned to the camera
+    // (setScrollFactor(0)) so they don't drift with the world, and both are
+    // destroyed together after durationMs. Passing an empty bottomLine shows
+    // only the top line (used for the "Level N" splash).
+    showBanner (topLine, bottomLine, durationMs)
+    {
+        const cx = this.scale.width / 2;
+        const cy = this.scale.height / 2;
+
+        const top = this.add.text(cx, cy, topLine, {
+            fontFamily: 'Arial Black',
+            fontSize: 56,
+            color: '#ffffff',
+            stroke: '#000000',
+            strokeThickness: 6,
+            align: 'center'
+        }).setOrigin(0.5, 1).setScrollFactor(0);
+
+        // Bottom line is optional -- skip the allocation entirely for the
+        // "Level N" splash which only needs a single line.
+        let bottom = null;
+        if (bottomLine && bottomLine.length > 0)
+        {
+            bottom = this.add.text(cx, cy + 8, bottomLine, {
+                fontFamily: 'Arial Black',
+                fontSize: 28,
+                color: '#ffffff',
+                stroke: '#000000',
+                strokeThickness: 4,
+                align: 'center'
+            }).setOrigin(0.5, 0).setScrollFactor(0);
+        }
+
+        this.time.delayedCall(durationMs, () => {
+            if (top && top.active) top.destroy();
+            if (bottom && bottom.active) bottom.destroy();
+        });
     }
 
     // Generate a solid-color circle texture we can use as a sprite.
